@@ -102,8 +102,9 @@ optional = true
 
 
 [dependencies.stereokit-rust]
-git = "https://github.com/mvvvv/StereoKit-rust.git"
+git = "https://github.com/Schmarni-Dev/StereoKit-rust.git"
 features = ["no-event-loop"]
+branch = "egl_fix_testing"
 default-features = false
 
 [dependencies.stardust-xr]
