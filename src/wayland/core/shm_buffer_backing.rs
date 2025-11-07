@@ -13,14 +13,19 @@ use mint::Vector2;
 use parking_lot::Mutex;
 use std::{
 	os::fd::OwnedFd,
-	sync::{Arc, OnceLock},
+	sync::{
+		Arc, OnceLock,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::Duration,
 };
-use tracing::debug_span;
+use tracing::{debug_span, info};
 use vulkano::{
-	buffer::BufferUsage,
+	Handle as _, VulkanError, VulkanObject,
+	buffer::{BufferUsage, Subbuffer},
 	command_buffer::{
-		AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo,
-		PrimaryCommandBufferAbstract,
+		AutoCommandBufferBuilder, CommandBufferSubmitInfo, CommandBufferUsage,
+		CopyBufferToImageInfo, SemaphoreSubmitInfo, SubmitInfo,
 	},
 	image::{
 		ImageAspect, ImageCreateFlags, ImageCreateInfo, ImageMemory, ImageTiling, ImageUsage,
@@ -28,12 +33,17 @@ use vulkano::{
 	},
 	memory::{
 		DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, MemoryAllocateInfo,
-		ResourceMemory,
+		MemoryPropertyFlags, ResourceMemory,
 		allocator::{AllocationCreateInfo, MemoryTypeFilter},
 	},
-	sync::GpuFuture,
+	sync::{
+		fence::{FenceCreateFlags, FenceCreateInfo},
+		semaphore::{Semaphore, SemaphoreType, SemaphoreWaitInfo},
+	},
 };
 use waynest_protocols::server::core::wayland::wl_shm::Format;
+
+static BACKINGS: AtomicU64 = AtomicU64::new(0);
 
 /// Parameters for a shared memory buffer
 pub struct ShmBufferBacking {
@@ -43,6 +53,7 @@ pub struct ShmBufferBacking {
 	size: Vector2<usize>,
 	wl_format: Format,
 	image: Arc<vulkano::image::Image>,
+	upload_buffer: Subbuffer<[u8]>,
 	tex: OnceLock<Handle<Image>>,
 	pending_imported_dmatex: Mutex<Option<ImportedTexture>>,
 }
@@ -69,6 +80,8 @@ impl ShmBufferBacking {
 		size: Vector2<usize>,
 		wl_format: Format,
 	) -> Self {
+		let num = BACKINGS.fetch_add(1, Ordering::Relaxed) + 1;
+		info!("shm backing spawned: {num}");
 		let vk = VULKANO_CONTEXT.wait();
 		let format = match wl_format {
 			Format::Argb8888 | Format::Xrgb8888 => vulkano::format::Format::B8G8R8A8_SRGB,
@@ -103,14 +116,24 @@ impl ShmBufferBacking {
 
 		let mem_reqs = raw_image.memory_requirements()[0];
 
-		let index = vk
-			.phys_dev
-			.memory_properties()
+		let props = vk.phys_dev.memory_properties();
+		let index = props
 			.memory_types
 			.iter()
 			.enumerate()
-			.map(|(i, _v)| i as u32)
-			.find(|i| mem_reqs.memory_type_bits & (1 << i) != 0)
+			.filter(|(i, _)| mem_reqs.memory_type_bits & (1 << i) != 0)
+			.filter(|(_, v)| v.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL))
+			.reduce(|v1, v2| {
+				if dbg!(props.memory_heaps[v1.1.heap_index as usize].size)
+					> dbg!(props.memory_heaps[v2.1.heap_index as usize].size)
+				{
+					v1
+				} else {
+					v2
+				}
+			})
+			.inspect(|(_, mem)| info!(?mem))
+			.map(|(i, _)| i as u32)
 			.expect("no valid memory type");
 
 		let mem = ResourceMemory::new_dedicated(
@@ -183,21 +206,8 @@ impl ShmBufferBacking {
 			DmatexUsage::Sampling,
 		)
 		.unwrap();
-		Self {
-			pool,
-			offset,
-			stride,
-			size,
-			wl_format,
-			image,
-			pending_imported_dmatex: Mutex::new(Some(imported_dmatex)),
-			tex: OnceLock::new(),
-		}
-	}
-	pub fn on_commit(&self) {
-		let vk = VULKANO_CONTEXT.wait();
-		let data_len = self.size.x * self.size.y * 4;
-		let gpu_buffer = vulkano::buffer::Buffer::new_slice::<u8>(
+		let data_len = size.x * size.y * 4;
+		let upload_buffer = vulkano::buffer::Buffer::new_slice::<u8>(
 			vk.alloc.clone(),
 			vulkano::buffer::BufferCreateInfo {
 				usage: BufferUsage::TRANSFER_SRC,
@@ -210,40 +220,99 @@ impl ShmBufferBacking {
 			data_len as u64,
 		)
 		.unwrap();
-		{
-			let _span = debug_span!("copy to gpu buffer").entered();
-			let shm_data_lock = self.pool.data_lock();
-			let mut gpu_slice = gpu_buffer.write().unwrap();
-			for (shm_offset, gpu_offset) in
-				(0..self.size.y).map(|v| (self.offset + (v * self.stride), (v * (self.size.x * 4))))
-			{
-				let line_slice = &shm_data_lock[shm_offset..(shm_offset + (self.size.x * 4))];
-				let gpu_subslice = &mut gpu_slice[gpu_offset..(gpu_offset + (self.size.x * 4))];
-				gpu_subslice.copy_from_slice(line_slice);
-			}
+		Self {
+			pool,
+			offset,
+			stride,
+			size,
+			wl_format,
+			image,
+			upload_buffer,
+			pending_imported_dmatex: Mutex::new(Some(imported_dmatex)),
+			tex: OnceLock::new(),
 		}
-		let mut command_buffer = AutoCommandBufferBuilder::primary(
-			vk.command_buffer_alloc.clone(),
-			vk.queue.queue_family_index(),
-			CommandBufferUsage::OneTimeSubmit,
-		)
-		.unwrap();
+	}
+	pub fn on_commit(&self) {
+		let vk = VULKANO_CONTEXT.wait();
+		tokio::task::block_in_place(|| {
+			info!("queue: {:x}", vk.queue.handle().as_raw());
+			vk.queue.with(|mut guard| {
+				{
+					let _span = debug_span!("copy to gpu buffer").entered();
+					let shm_data_lock = self.pool.data_lock();
+					let mut gpu_slice = self.upload_buffer.write().unwrap();
+					for (shm_offset, gpu_offset) in (0..self.size.y)
+						.map(|v| (self.offset + (v * self.stride), (v * (self.size.x * 4))))
+					{
+						let line_slice =
+							&shm_data_lock[shm_offset..(shm_offset + (self.size.x * 4))];
+						let gpu_subslice =
+							&mut gpu_slice[gpu_offset..(gpu_offset + (self.size.x * 4))];
+						gpu_subslice.copy_from_slice(line_slice);
+					}
+				}
+				let mut command_buffer = AutoCommandBufferBuilder::primary(
+					vk.command_buffer_alloc.clone(),
+					vk.queue.queue_family_index(),
+					CommandBufferUsage::OneTimeSubmit,
+				)
+				.unwrap();
 
-		command_buffer
-			.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-				gpu_buffer.clone(),
-				self.image.clone(),
-			))
-			.unwrap();
+				command_buffer
+					.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+						self.upload_buffer.clone(),
+						self.image.clone(),
+					))
+					.unwrap();
 
-		let command_buffer = command_buffer.build().unwrap();
-		command_buffer
-			.execute(vk.queue.clone())
-			.unwrap()
-			.then_signal_fence_and_flush()
-			.unwrap()
-			.wait(None)
-			.unwrap();
+				let command_buffer = command_buffer.build().unwrap();
+				// let fence = Arc::new(
+				// 	vulkano::sync::fence::Fence::new(vk.dev.clone(), FenceCreateInfo::default())
+				// 		.unwrap(),
+				// );
+				// let semaphore: Arc<_> = Semaphore::new(
+				// 	vk.dev.clone(),
+				// 	vulkano::sync::semaphore::SemaphoreCreateInfo {
+				// 		semaphore_type: SemaphoreType::Timeline,
+				// 		..Default::default()
+				// 	},
+				// )
+				// .unwrap()
+				// .into();
+				unsafe {
+					guard
+						.submit(
+							&[SubmitInfo {
+								command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
+								// signal_semaphores: vec![{
+								// 	let mut info = SemaphoreSubmitInfo::new(semaphore.clone());
+								// 	info.value = 1;
+								// 	info
+								// }],
+								..Default::default()
+							}],
+							// Some(&fence),
+							None
+						)
+						.unwrap();
+				}
+				info!("b");
+				// match semaphore.wait(
+				// 	SemaphoreWaitInfo {
+				// 		value: 1,
+				// 		..Default::default()
+				// 	},
+				// 	None,
+				// ) {
+				// 	Ok(_) | Err(vulkano::Validated::Error(VulkanError::Timeout)) => {}
+				// 	Err(err) => panic!("{}", err),
+				// };
+				// fence.wait(None).unwrap();
+				guard.wait_idle().unwrap();
+				info!("c");
+			});
+			info!("d");
+		});
 	}
 
 	#[tracing::instrument("debug", skip_all)]
@@ -272,5 +341,11 @@ impl ShmBufferBacking {
 
 	pub fn size(&self) -> Vector2<usize> {
 		self.size
+	}
+}
+impl Drop for ShmBufferBacking {
+	fn drop(&mut self) {
+		let num = BACKINGS.fetch_sub(1, Ordering::Relaxed) - 1;
+		info!("shm backing dropped: {num}");
 	}
 }

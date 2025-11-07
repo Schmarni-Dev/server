@@ -10,7 +10,7 @@ use vulkano::{
 		CommandBufferAllocator, StandardCommandBufferAllocator,
 		StandardCommandBufferAllocatorCreateInfo,
 	},
-	device::{DeviceCreateInfo, QueueCreateInfo},
+	device::{DeviceCreateInfo, DeviceFeatures, QueueCreateInfo},
 	instance::InstanceCreateFlags,
 	memory::allocator::{MemoryAllocator, StandardMemoryAllocator},
 };
@@ -94,7 +94,11 @@ pub fn setup_vulkano_context(
 							.map(|v| v.to_str().unwrap()),
 					),
 					// this is def wrong, lets hope it doesn't cause issues....
-					enabled_features: vulkano::device::DeviceFeatures::empty(),
+					enabled_features: DeviceFeatures {
+						// lets hope this is always true lol
+						timeline_semaphore: true,
+						..DeviceFeatures::empty()
+					},
 
 					..Default::default()
 				},
