@@ -1,47 +1,21 @@
 use super::shm_pool::ShmPool;
-use crate::wayland::{RENDER_DEVICE, vulkano_data::VULKANO_CONTEXT};
+use crate::wayland::{vulkano_data::VULKANO_CONTEXT, wgpu_data::WGPU_CONTEXT};
 use bevy::{
 	asset::{Assets, Handle},
 	image::Image,
+	render::render_resource::{Texture, TextureView},
 };
-use bevy_dmabuf::{
-	dmatex::{Dmatex, DmatexPlane, Resolution},
-	import::{DmatexUsage, DropCallback, ImportedDmatexs, ImportedTexture, import_texture},
-};
-use drm_fourcc::DrmFourcc;
+use bevy_dmabuf::import::{ImportedDmatexs, ImportedTexture};
 use mint::Vector2;
-use parking_lot::Mutex;
-use std::{
-	os::fd::OwnedFd,
-	sync::{
-		Arc, OnceLock,
-		atomic::{AtomicU64, Ordering},
-	},
-	time::Duration,
+use std::sync::{
+	Arc, OnceLock,
+	atomic::{AtomicU64, Ordering},
 };
 use tracing::{debug_span, info};
-use vulkano::{
-	Handle as _, VulkanError, VulkanObject,
-	buffer::{BufferUsage, Subbuffer},
-	command_buffer::{
-		AutoCommandBufferBuilder, CommandBufferSubmitInfo, CommandBufferUsage,
-		CopyBufferToImageInfo, SemaphoreSubmitInfo, SubmitInfo,
-	},
-	image::{
-		ImageAspect, ImageCreateFlags, ImageCreateInfo, ImageMemory, ImageTiling, ImageUsage,
-		sys::RawImage,
-	},
-	memory::{
-		DedicatedAllocation, DeviceMemory, ExternalMemoryHandleType, MemoryAllocateInfo,
-		MemoryPropertyFlags, ResourceMemory,
-		allocator::{AllocationCreateInfo, MemoryTypeFilter},
-	},
-	sync::{
-		fence::{FenceCreateFlags, FenceCreateInfo},
-		semaphore::{Semaphore, SemaphoreType, SemaphoreWaitInfo},
-	},
-};
 use waynest_protocols::server::core::wayland::wl_shm::Format;
+use wgpu_types::{
+	Extent3d, TextureAspect, TextureUsages, TextureViewDescriptor, TextureViewDimension,
+};
 
 static BACKINGS: AtomicU64 = AtomicU64::new(0);
 
@@ -52,10 +26,10 @@ pub struct ShmBufferBacking {
 	stride: usize,
 	size: Vector2<usize>,
 	wl_format: Format,
-	image: Arc<vulkano::image::Image>,
-	upload_buffer: Subbuffer<[u8]>,
+	image: Texture,
+	view: TextureView,
+	extent: Extent3d,
 	tex: OnceLock<Handle<Image>>,
-	pending_imported_dmatex: Mutex<Option<ImportedTexture>>,
 }
 
 impl std::fmt::Debug for ShmBufferBacking {
@@ -65,7 +39,6 @@ impl std::fmt::Debug for ShmBufferBacking {
 			.field("offset", &self.offset)
 			.field("stride", &self.stride)
 			.field("size", &self.size)
-			.field("wl_format", &self.wl_format)
 			.field("image", &self.image)
 			.field("tex", &self.tex)
 			.finish()
@@ -83,143 +56,38 @@ impl ShmBufferBacking {
 		let num = BACKINGS.fetch_add(1, Ordering::Relaxed) + 1;
 		info!("shm backing spawned: {num}");
 		let vk = VULKANO_CONTEXT.wait();
+		let wgpu = WGPU_CONTEXT.wait();
 		let format = match wl_format {
-			Format::Argb8888 | Format::Xrgb8888 => vulkano::format::Format::B8G8R8A8_SRGB,
+			Format::Argb8888 | Format::Xrgb8888 => wgpu_types::TextureFormat::Bgra8UnormSrgb,
 			_ => unimplemented!(),
 		};
-		let modifiers = vk
-			.phys_dev
-			.format_properties(format)
-			.unwrap()
-			.drm_format_modifier_properties
-			.into_iter()
-			.filter_map(|v| {
-				(v.drm_format_modifier_plane_count == 1).then_some(v.drm_format_modifier)
-			})
-			.collect();
-		let raw_image = RawImage::new(
-			vk.dev.clone(),
-			ImageCreateInfo {
-				flags: ImageCreateFlags::empty(),
-				image_type: vulkano::image::ImageType::Dim2d,
-				format,
-				extent: [size.x as u32, size.y as u32, 1],
-				tiling: ImageTiling::DrmFormatModifier,
-				usage: ImageUsage::TRANSFER_DST,
-				drm_format_modifiers: modifiers,
-				external_memory_handle_types: ExternalMemoryHandleType::DmaBuf.into(),
-				..Default::default()
-			},
-		)
-		.unwrap();
-		let (modifier, num_planes) = raw_image.drm_format_modifier().unwrap();
-
-		let mem_reqs = raw_image.memory_requirements()[0];
-
-		let props = vk.phys_dev.memory_properties();
-		let index = props
-			.memory_types
-			.iter()
-			.enumerate()
-			.filter(|(i, _)| mem_reqs.memory_type_bits & (1 << i) != 0)
-			.filter(|(_, v)| v.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL))
-			.reduce(|v1, v2| {
-				if dbg!(props.memory_heaps[v1.1.heap_index as usize].size)
-					> dbg!(props.memory_heaps[v2.1.heap_index as usize].size)
-				{
-					v1
-				} else {
-					v2
-				}
-			})
-			.inspect(|(_, mem)| info!(?mem))
-			.map(|(i, _)| i as u32)
-			.expect("no valid memory type");
-
-		let mem = ResourceMemory::new_dedicated(
-			DeviceMemory::allocate(
-				vk.dev.clone(),
-				MemoryAllocateInfo {
-					allocation_size: mem_reqs.layout.size(),
-					memory_type_index: index,
-					dedicated_allocation: Some(DedicatedAllocation::Image(&raw_image)),
-					export_handle_types: ExternalMemoryHandleType::DmaBuf.into(),
-					..Default::default()
-				},
-			)
-			.unwrap(),
-		);
-		let Ok(image) = raw_image.bind_memory([mem]) else {
-			panic!("unable to bind memory")
+		let extent = Extent3d {
+			width: size.x as u32,
+			height: size.y as u32,
+			depth_or_array_layers: 1,
 		};
-		let image = Arc::new(image);
-		let ImageMemory::Normal(mem) = image.memory() else {
-			unreachable!()
+		let descriptor = wgpu_types::TextureDescriptor::<_, &[_]> {
+			label: Some("Wayland Shm Image"),
+			size: extent,
+			mip_level_count: 1,
+			sample_count: 1,
+			dimension: wgpu_types::TextureDimension::D2,
+			format,
+			usage: TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
+			view_formats: &[format],
 		};
-
-		let [mem] = mem.as_slice() else {
-			unreachable!()
-		};
-
-		let fd = OwnedFd::from(
-			mem.device_memory()
-				.export_fd(ExternalMemoryHandleType::DmaBuf)
-				.unwrap(),
-		);
-
-		let planes = (0..num_planes)
-			.filter_map(|i| {
-				Some(match i {
-					0 => ImageAspect::MemoryPlane0,
-					1 => ImageAspect::MemoryPlane1,
-					2 => ImageAspect::MemoryPlane2,
-					3 => ImageAspect::MemoryPlane3,
-					_ => return None,
-				})
-			})
-			.map(|aspect| {
-				let plane_layout = image.subresource_layout(aspect, 0, 0).unwrap();
-
-				DmatexPlane {
-					dmabuf_fd: fd.try_clone().unwrap().into(),
-					modifier,
-					offset: plane_layout.offset as u32,
-					stride: plane_layout.row_pitch as i32,
-				}
-			})
-			.collect::<Vec<_>>();
-
-		let dmatex = Dmatex {
-			planes,
-			res: Resolution {
-				x: size.x as u32,
-				y: size.y as u32,
-			},
-			format: DrmFourcc::Argb8888 as u32,
-			flip_y: false,
-			srgb: true,
-		};
-		let imported_dmatex = import_texture(
-			RENDER_DEVICE.wait(),
-			dmatex,
-			DropCallback(None),
-			DmatexUsage::Sampling,
-		)
-		.unwrap();
-		let data_len = size.x * size.y * 4;
-		let upload_buffer = vulkano::buffer::Buffer::new_slice::<u8>(
-			vk.alloc.clone(),
-			vulkano::buffer::BufferCreateInfo {
-				usage: BufferUsage::TRANSFER_SRC,
-				..Default::default()
-			},
-			AllocationCreateInfo {
-				memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-				..Default::default()
-			},
-			data_len as u64,
-		)
-		.unwrap();
+		let image = wgpu.dev.create_texture(&descriptor);
+		let view = image.create_view(&TextureViewDescriptor {
+			label: Some("Wayland Shm Image View"),
+			format: Some(format),
+			dimension: Some(TextureViewDimension::D2),
+			usage: Some(TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING),
+			aspect: TextureAspect::All,
+			base_mip_level: 0,
+			mip_level_count: None,
+			base_array_layer: 0,
+			array_layer_count: None,
+		});
 		Self {
 			pool,
 			offset,
@@ -227,92 +95,40 @@ impl ShmBufferBacking {
 			size,
 			wl_format,
 			image,
-			upload_buffer,
-			pending_imported_dmatex: Mutex::new(Some(imported_dmatex)),
+			view,
+			extent,
 			tex: OnceLock::new(),
 		}
 	}
 	pub fn on_commit(&self) {
-		let vk = VULKANO_CONTEXT.wait();
-		tokio::task::block_in_place(|| {
-			info!("queue: {:x}", vk.queue.handle().as_raw());
-			vk.queue.with(|mut guard| {
-				{
-					let _span = debug_span!("copy to gpu buffer").entered();
-					let shm_data_lock = self.pool.data_lock();
-					let mut gpu_slice = self.upload_buffer.write().unwrap();
-					for (shm_offset, gpu_offset) in (0..self.size.y)
-						.map(|v| (self.offset + (v * self.stride), (v * (self.size.x * 4))))
-					{
-						let line_slice =
-							&shm_data_lock[shm_offset..(shm_offset + (self.size.x * 4))];
-						let gpu_subslice =
-							&mut gpu_slice[gpu_offset..(gpu_offset + (self.size.x * 4))];
-						gpu_subslice.copy_from_slice(line_slice);
-					}
-				}
-				let mut command_buffer = AutoCommandBufferBuilder::primary(
-					vk.command_buffer_alloc.clone(),
-					vk.queue.queue_family_index(),
-					CommandBufferUsage::OneTimeSubmit,
-				)
-				.unwrap();
-
-				command_buffer
-					.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-						self.upload_buffer.clone(),
-						self.image.clone(),
-					))
-					.unwrap();
-
-				let command_buffer = command_buffer.build().unwrap();
-				// let fence = Arc::new(
-				// 	vulkano::sync::fence::Fence::new(vk.dev.clone(), FenceCreateInfo::default())
-				// 		.unwrap(),
-				// );
-				// let semaphore: Arc<_> = Semaphore::new(
-				// 	vk.dev.clone(),
-				// 	vulkano::sync::semaphore::SemaphoreCreateInfo {
-				// 		semaphore_type: SemaphoreType::Timeline,
-				// 		..Default::default()
-				// 	},
-				// )
-				// .unwrap()
-				// .into();
-				unsafe {
-					guard
-						.submit(
-							&[SubmitInfo {
-								command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
-								// signal_semaphores: vec![{
-								// 	let mut info = SemaphoreSubmitInfo::new(semaphore.clone());
-								// 	info.value = 1;
-								// 	info
-								// }],
-								..Default::default()
-							}],
-							// Some(&fence),
-							None
-						)
-						.unwrap();
-				}
-				info!("b");
-				// match semaphore.wait(
-				// 	SemaphoreWaitInfo {
-				// 		value: 1,
-				// 		..Default::default()
-				// 	},
-				// 	None,
-				// ) {
-				// 	Ok(_) | Err(vulkano::Validated::Error(VulkanError::Timeout)) => {}
-				// 	Err(err) => panic!("{}", err),
-				// };
-				// fence.wait(None).unwrap();
-				guard.wait_idle().unwrap();
-				info!("c");
-			});
-			info!("d");
-		});
+		let wgpu = WGPU_CONTEXT.wait();
+		// let mut data = vec![0u8; self.size.x * self.size.y * 4];
+		// {
+		// 	let _span = debug_span!("copy to gpu buffer").entered();
+		// 	let shm_data_lock = self.pool.data_lock();
+		// 	let mut gpu_slice = &mut data;
+		// 	for (shm_offset, gpu_offset) in
+		// 		(0..self.size.y).map(|v| (self.offset + (v * self.stride), (v * (self.size.x * 4))))
+		// 	{
+		// 		let line_slice = &shm_data_lock[shm_offset..(shm_offset + (self.size.x * 4))];
+		// 		let gpu_subslice = &mut gpu_slice[gpu_offset..(gpu_offset + (self.size.x * 4))];
+		// 		gpu_subslice.copy_from_slice(line_slice);
+		// 	}
+		// }
+		info!("huh?!");
+		wgpu.queue.write_texture(
+			self.image.as_image_copy(),
+			&self.pool.data_lock(),
+			wgpu_types::TexelCopyBufferLayout {
+				offset: self.offset as u64,
+				bytes_per_row: Some(self.stride as u32),
+				rows_per_image: Some(self.size.y as u32),
+			},
+			self.extent,
+		);
+		info!("help");
+		wgpu.queue.submit([]);
+		info!("me");
 	}
 
 	#[tracing::instrument("debug", skip_all)]
@@ -321,14 +137,14 @@ impl ShmBufferBacking {
 		dmatexes: &ImportedDmatexs,
 		images: &mut Assets<Image>,
 	) -> Option<Handle<Image>> {
-		self.pending_imported_dmatex
-			.lock()
-			.take()
-			.map(|tex| dmatexes.insert_imported_dmatex(images, tex))
-			.inspect(|handle| {
-				_ = self.tex.set(handle.clone());
-			});
-		self.tex.get().cloned()
+		Some(
+			self.tex
+				.get_or_init(|| {
+					let imported = ImportedTexture::new(self.image.clone(), self.view.clone());
+					dmatexes.insert_imported_dmatex(images, imported)
+				})
+				.clone(),
+		)
 	}
 
 	pub fn is_transparent(&self) -> bool {

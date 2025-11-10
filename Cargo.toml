@@ -170,6 +170,7 @@ ash = { version = "0.38.0", optional = true, default-features = false }
 rustix = { version = "1.0.8", features = ["time"] }
 pin-project-lite = "0.2.16"
 futures-sink = "0.3.31"
+wgpu-types = { version = "24", default-features = false, features = ["std"] }
 
 [dependencies.stardust-xr]
 workspace = true

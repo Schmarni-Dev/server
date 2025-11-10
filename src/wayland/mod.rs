@@ -8,6 +8,7 @@ mod util;
 mod viewporter;
 mod vulkano_data;
 mod xdg;
+mod wgpu_data;
 
 use crate::core::error::ServerError;
 use crate::core::registry::OwnedRegistry;
@@ -17,6 +18,7 @@ use crate::wayland::core::seat::SeatMessage;
 use crate::wayland::core::surface::Surface;
 use crate::wayland::presentation::MonotonicTimestamp;
 use crate::wayland::util::ClientExt;
+use crate::wayland::wgpu_data::setup_wgpu_context;
 use crate::{BevyMaterial, core::task};
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::schedule::IntoScheduleConfigs;
@@ -434,6 +436,7 @@ impl Plugin for WaylandPlugin {
 	fn finish(&self, app: &mut App) {
 		app.sub_app_mut(RenderApp)
 			.add_systems(Render, setup_vulkano_context)
+			.add_systems(Render, setup_wgpu_context)
 			.add_systems(Render, before_render.in_set(XrRenderSet::PreRender))
 			.add_systems(Render, after_render.in_set(XrRenderSet::PostRender))
 			.add_systems(
