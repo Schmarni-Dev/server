@@ -14,6 +14,7 @@ use crate::core::registry::OwnedRegistry;
 use crate::get_time;
 use crate::nodes::drawable::model::ModelNodeSystemSet;
 use crate::wayland::core::seat::SeatMessage;
+use crate::wayland::core::shm_buffer_backing::shm_upload_task;
 use crate::wayland::core::surface::Surface;
 use crate::wayland::presentation::MonotonicTimestamp;
 use crate::wayland::util::ClientExt;
@@ -430,6 +431,8 @@ impl Plugin for WaylandPlugin {
 				Render,
 				init_render_device.run_if(|| RENDER_DEVICE.get().is_none()),
 			);
+		// yes i'm using this for a bit of setup
+		tokio::spawn(shm_upload_task());
 	}
 	fn finish(&self, app: &mut App) {
 		app.sub_app_mut(RenderApp)

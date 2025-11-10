@@ -71,10 +71,10 @@ impl Buffer {
 	}
 
 	#[tracing::instrument(level = "debug", skip_all)]
-	pub fn on_commit(&self) {
+	pub async fn on_commit(&self) {
 		tracing::debug!("running on_commit for buffer {:?}", self.id);
 		match &self.backing {
-			BufferBacking::Shm(backing) => backing.on_commit(),
+			BufferBacking::Shm(backing) => backing.on_commit().await,
 			BufferBacking::Dmabuf(_backing) => {}
 		}
 	}

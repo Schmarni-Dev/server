@@ -417,9 +417,7 @@ impl WlSurface for Surface {
 			.as_ref()
 			.map(|b| b.buffer.clone());
 		if let Some(buffer) = buffer_option {
-			tokio::task::spawn_blocking(move || buffer.on_commit())
-				.await
-				.unwrap();
+			buffer.on_commit().await;
 		}
 		self.state.lock().apply();
 

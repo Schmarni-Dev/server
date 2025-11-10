@@ -19,6 +19,7 @@ use std::{
 	},
 	time::Duration,
 };
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug_span, info};
 use vulkano::{
 	Handle as _, VulkanError, VulkanObject,
@@ -232,87 +233,26 @@ impl ShmBufferBacking {
 			tex: OnceLock::new(),
 		}
 	}
-	pub fn on_commit(&self) {
-		let vk = VULKANO_CONTEXT.wait();
+	pub async fn on_commit(&self) {
 		tokio::task::block_in_place(|| {
-			info!("queue: {:x}", vk.queue.handle().as_raw());
-			vk.queue.with(|mut guard| {
-				{
-					let _span = debug_span!("copy to gpu buffer").entered();
-					let shm_data_lock = self.pool.data_lock();
-					let mut gpu_slice = self.upload_buffer.write().unwrap();
-					for (shm_offset, gpu_offset) in (0..self.size.y)
-						.map(|v| (self.offset + (v * self.stride), (v * (self.size.x * 4))))
-					{
-						let line_slice =
-							&shm_data_lock[shm_offset..(shm_offset + (self.size.x * 4))];
-						let gpu_subslice =
-							&mut gpu_slice[gpu_offset..(gpu_offset + (self.size.x * 4))];
-						gpu_subslice.copy_from_slice(line_slice);
-					}
-				}
-				let mut command_buffer = AutoCommandBufferBuilder::primary(
-					vk.command_buffer_alloc.clone(),
-					vk.queue.queue_family_index(),
-					CommandBufferUsage::OneTimeSubmit,
-				)
-				.unwrap();
-
-				command_buffer
-					.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-						self.upload_buffer.clone(),
-						self.image.clone(),
-					))
-					.unwrap();
-
-				let command_buffer = command_buffer.build().unwrap();
-				// let fence = Arc::new(
-				// 	vulkano::sync::fence::Fence::new(vk.dev.clone(), FenceCreateInfo::default())
-				// 		.unwrap(),
-				// );
-				// let semaphore: Arc<_> = Semaphore::new(
-				// 	vk.dev.clone(),
-				// 	vulkano::sync::semaphore::SemaphoreCreateInfo {
-				// 		semaphore_type: SemaphoreType::Timeline,
-				// 		..Default::default()
-				// 	},
-				// )
-				// .unwrap()
-				// .into();
-				unsafe {
-					guard
-						.submit(
-							&[SubmitInfo {
-								command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
-								// signal_semaphores: vec![{
-								// 	let mut info = SemaphoreSubmitInfo::new(semaphore.clone());
-								// 	info.value = 1;
-								// 	info
-								// }],
-								..Default::default()
-							}],
-							// Some(&fence),
-							None
-						)
-						.unwrap();
-				}
-				info!("b");
-				// match semaphore.wait(
-				// 	SemaphoreWaitInfo {
-				// 		value: 1,
-				// 		..Default::default()
-				// 	},
-				// 	None,
-				// ) {
-				// 	Ok(_) | Err(vulkano::Validated::Error(VulkanError::Timeout)) => {}
-				// 	Err(err) => panic!("{}", err),
-				// };
-				// fence.wait(None).unwrap();
-				guard.wait_idle().unwrap();
-				info!("c");
-			});
-			info!("d");
+			let _span = debug_span!("copy to gpu buffer").entered();
+			let shm_data_lock = self.pool.data_lock();
+			let mut gpu_slice = self.upload_buffer.write().unwrap();
+			for (shm_offset, gpu_offset) in
+				(0..self.size.y).map(|v| (self.offset + (v * self.stride), (v * (self.size.x * 4))))
+			{
+				let line_slice = &shm_data_lock[shm_offset..(shm_offset + (self.size.x * 4))];
+				let gpu_subslice = &mut gpu_slice[gpu_offset..(gpu_offset + (self.size.x * 4))];
+				gpu_subslice.copy_from_slice(line_slice);
+			}
 		});
+		let notify = Arc::new(Notify::new());
+		_ = BUFFER_COPY_CHANNEL.wait().send((
+			self.image.clone(),
+			self.upload_buffer.clone(),
+			notify.clone(),
+		));
+		notify.notified().await;
 	}
 
 	#[tracing::instrument("debug", skip_all)]
@@ -343,6 +283,98 @@ impl ShmBufferBacking {
 		self.size
 	}
 }
+
+static BUFFER_COPY_CHANNEL: OnceLock<
+	mpsc::UnboundedSender<(Arc<vulkano::image::Image>, Subbuffer<[u8]>, Arc<Notify>)>,
+> = OnceLock::new();
+
+pub async fn shm_upload_task() {
+	let (tx, mut rx) = mpsc::unbounded_channel();
+	_ = BUFFER_COPY_CHANNEL.set(tx);
+	let mut notifies = Vec::new();
+	let mut buffer = Vec::new();
+	loop {
+		rx.recv_many(&mut buffer, 256).await;
+		let iter = buffer.drain(..).map(|(image, buf, notif)| {
+			notifies.push(notif);
+			(image, buf)
+		});
+		// not super happy, ideally this would spawn a new thread, should be mostly fine tho?
+		tokio::task::block_in_place(|| copy_buffers_to_image(iter));
+		for n in notifies.drain(..) {
+			n.notify_one();
+		}
+	}
+}
+
+fn copy_buffers_to_image(
+	iter: impl Iterator<Item = (Arc<vulkano::image::Image>, Subbuffer<[u8]>)>,
+) {
+	let vk = VULKANO_CONTEXT.wait();
+	info!("queue: {:x}", vk.queue.handle().as_raw());
+	vk.queue.with(|mut guard| {
+		let mut command_buffer = AutoCommandBufferBuilder::primary(
+			vk.command_buffer_alloc.clone(),
+			vk.queue.queue_family_index(),
+			CommandBufferUsage::OneTimeSubmit,
+		)
+		.unwrap();
+
+		for (image, buffer) in iter {
+			command_buffer
+				.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(buffer, image))
+				.unwrap();
+		}
+
+		let command_buffer = command_buffer.build().unwrap();
+		// let fence = Arc::new(
+		// 	vulkano::sync::fence::Fence::new(vk.dev.clone(), FenceCreateInfo::default())
+		// 		.unwrap(),
+		// );
+		// let semaphore: Arc<_> = Semaphore::new(
+		// 	vk.dev.clone(),
+		// 	vulkano::sync::semaphore::SemaphoreCreateInfo {
+		// 		semaphore_type: SemaphoreType::Timeline,
+		// 		..Default::default()
+		// 	},
+		// )
+		// .unwrap()
+		// .into();
+		unsafe {
+			guard
+				.submit(
+					&[SubmitInfo {
+						command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
+						// signal_semaphores: vec![{
+						// 	let mut info = SemaphoreSubmitInfo::new(semaphore.clone());
+						// 	info.value = 1;
+						// 	info
+						// }],
+						..Default::default()
+					}],
+					// Some(&fence),
+					None,
+				)
+				.unwrap();
+		}
+		info!("b");
+		// match semaphore.wait(
+		// 	SemaphoreWaitInfo {
+		// 		value: 1,
+		// 		..Default::default()
+		// 	},
+		// 	None,
+		// ) {
+		// 	Ok(_) | Err(vulkano::Validated::Error(VulkanError::Timeout)) => {}
+		// 	Err(err) => panic!("{}", err),
+		// };
+		// fence.wait(None).unwrap();
+		guard.wait_idle().unwrap();
+		info!("c");
+	});
+	info!("d");
+}
+
 impl Drop for ShmBufferBacking {
 	fn drop(&mut self) {
 		let num = BACKINGS.fetch_sub(1, Ordering::Relaxed) - 1;
